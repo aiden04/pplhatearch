@@ -35,7 +35,8 @@ Additional flags:
 - `-f` – when used with `-R`, forward to `pacman -f` (force removal even if dependencies break)
 - `-Ss` – search the backup AUR mirror for packages (accepts search terms)
 - `-Si` – show package information pulled from `.SRCINFO`
-- `-Q` – display information about locally installed packages (delegates to `pacman -Qi`)
+- `-Q` – list packages that pplhatearch successfully built/installed
+- `--clear-cache` – delete the entire pplhatearch cache directory (branches + build trees) and exit
 
 Set `PPLHATEARCH_CACHE` to override the default cache directory when `-C` is not provided.
 
@@ -80,7 +81,7 @@ pplhatearch now includes lightweight query tooling backed by the Git mirror:
 
 - `./pplhatearch -Ss <term>` – lists matching branches (package names) using `git ls-remote` (results cached ~15 minutes under `~/.cache/pplhatearch/branches.cache`).
 - `./pplhatearch -Si <pkg>` – fetches the package into the cache (without building) and prints `.SRCINFO` metadata (version, description, depends, etc.).
-- `./pplhatearch -Q <pkg>` – delegates to `pacman -Qi` for locally installed packages.
+- `./pplhatearch -Q [pkg ...]` – prints the list of packages that pplhatearch has successfully built/installed (optionally filtered by name). This list is stored under `XDG_STATE_HOME/pplhatearch/installed.txt` (or `~/.local/state/pplhatearch/installed.txt`) and is not cleared by `--clear-cache`.
 
 Examples:
 
@@ -98,15 +99,18 @@ Depends On      : ffmpeg
 Make Deps       : git cmake
 License         : MIT
 
-$ ./pplhatearch -Q anime4k
-Name            : anime4k
-Version         : 4.0.1-3
-Description     : High-Quality Anime Upscaling
-Depends On      : ffmpeg
-...
+$ ./pplhatearch -Q
+anime4k
+discord
 ```
 
 `-Ss` uses the cached branch list to avoid hitting GitHub for every search; use `-C`/`PPLHATEARCH_CACHE` to relocate both build trees and the branch cache file.
+
+### Cache Management
+
+Run `./pplhatearch --clear-cache` (optionally with `-C <path>`) to delete all cached package directories and the cached branch list. This command cannot be combined with other operations.
+
+Installed package metadata used by `-Q` lives under `XDG_STATE_HOME/pplhatearch` (or `~/.local/state/pplhatearch`); it persists across cache clears and is pruned automatically when packages are removed via `-R`.
 
 ### Sample Output
 
