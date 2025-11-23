@@ -38,7 +38,7 @@ Additional flags:
 - `-Q` – list packages that pplhatearch successfully built/installed
 - `--clear-cache` – delete the entire pplhatearch cache directory (branches + build trees) and exit
 
-Set `PPLHATEARCH_CACHE` to override the default cache directory when `-C` is not provided.
+Set `PPLHATEARCH_CACHE` to override the default cache directory when `-C` is not provided. Set `PPLHATEARCH_STATE` to override where pplhatearch stores state (defaults to `XDG_STATE_HOME/pplhatearch` or `~/.local/state/pplhatearch`).
 
 Example: clone the `brave-bin` branch from the mirror into the current directory.
 
@@ -110,7 +110,7 @@ discord
 
 Run `./pplhatearch --clear-cache` (optionally with `-C <path>`) to delete all cached package directories and the cached branch list. This command cannot be combined with other operations.
 
-Installed package metadata used by `-Q` lives under `XDG_STATE_HOME/pplhatearch` (or `~/.local/state/pplhatearch`); it persists across cache clears and is pruned automatically when packages are removed via `-R`.
+Installed package metadata used by `-Q` lives under `XDG_STATE_HOME/pplhatearch` (or `~/.local/state/pplhatearch`, override with `PPLHATEARCH_STATE`); it persists across cache clears and is pruned automatically when packages are removed via `-R`.
 
 ### Sample Output
 
