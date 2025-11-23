@@ -9,7 +9,7 @@ _pplhatearch()
     cur="${COMP_WORDS[COMP_CWORD]}"
     prev="${COMP_WORDS[COMP_CWORD-1]}"
 
-    opts="-S -R -Ss -Si -Q -C -repo -color -n -s -d -f -h --help"
+    opts="-S -R -Ss -Si -Q -C -repo -color -n -s -d -f --clear-cache -h --help"
 
     case "${prev}" in
         -C)
