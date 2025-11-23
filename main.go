@@ -9,8 +9,10 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 )
@@ -19,6 +21,15 @@ const (
 	defaultRepo       = "https://github.com/archlinux/aur.git"
 	branchCacheName   = "branches.cache"
 	branchCacheMaxAge = 15 * time.Minute
+	installedListFile = "installed.txt"
+
+	colorReset   = "\033[0m"
+	colorBlue    = "\033[1;34m"
+	colorGreen   = "\033[1;32m"
+	colorYellow  = "\033[1;33m"
+	colorMagenta = "\033[1;35m"
+	colorCyan    = "\033[1;36m"
+	colorWhite   = "\033[1;37m"
 )
 
 var packagePattern = regexp.MustCompile(`^[a-z0-9@._+-]+$`)
@@ -30,7 +41,8 @@ func main() {
 	removeFlag := flag.Bool("R", false, "remove packages (delete local clones)")
 	searchFlag := flag.Bool("Ss", false, "search packages in the backup AUR mirror")
 	infoFlag := flag.Bool("Si", false, "show package information from the backup AUR mirror")
-	queryFlag := flag.Bool("Q", false, "show information about installed packages (pacman -Qi)")
+	queryFlag := flag.Bool("Q", false, "list packages installed via pplhatearch")
+	clearCacheFlag := flag.Bool("clear-cache", false, "remove all cached package data and metadata, then exit")
 	rootDir := flag.String("C", defaultCacheDir(), "directory to install/remove packages from")
 	repoURL := flag.String("repo", defaultRepo, "AUR GitHub mirror to clone from")
 	colorFlag := flag.Bool("color", true, "enable colorized output")
@@ -46,6 +58,22 @@ func main() {
 
 	flag.Parse()
 
+	anyOperation := *installFlag || *removeFlag || *searchFlag || *infoFlag || *queryFlag
+
+	if *clearCacheFlag {
+		if anyOperation || flag.NArg() > 0 {
+			fmt.Fprintln(os.Stderr, "--clear-cache cannot be combined with other operations or package arguments")
+			os.Exit(2)
+		}
+		ui := newPrinter(os.Stdout, *colorFlag)
+		if err := clearCacheDir(*rootDir, ui); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		ui.Pacman("Cache cleared")
+		return
+	}
+
 	mode, err := determineMode(*installFlag, *removeFlag, *searchFlag, *infoFlag, *queryFlag)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -54,23 +82,26 @@ func main() {
 	}
 
 	packages := flag.Args()
-	if len(packages) == 0 {
-		fmt.Fprintln(os.Stderr, "at least one argument is required")
-		flag.Usage()
-		os.Exit(2)
-	}
 
 	ui := newPrinter(os.Stdout, *colorFlag)
 	inst := newInstaller(*rootDir, *repoURL, ui)
 
 	switch mode {
 	case modeSearch:
+		if len(packages) == 0 {
+			fmt.Fprintln(os.Stderr, "-Ss requires at least one search term")
+			os.Exit(2)
+		}
 		if err := searchPackages(*rootDir, *repoURL, packages, ui); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}
 		return
 	case modeInfo:
+		if len(packages) == 0 {
+			fmt.Fprintln(os.Stderr, "-Si requires at least one package name")
+			os.Exit(2)
+		}
 		for _, pkg := range packages {
 			if err := validatePackageName(pkg); err != nil {
 				fmt.Fprintln(os.Stderr, err)
@@ -83,13 +114,22 @@ func main() {
 		}
 		return
 	case modeQuery:
-		if err := queryInstalledPackages(packages); err != nil {
+		if err := listInstalledPackages(packages, ui); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}
 		return
 	case modeInstall:
+		if len(packages) == 0 {
+			fmt.Fprintln(os.Stderr, "-S requires at least one package name")
+			os.Exit(2)
+		}
 		ui.AurSummary(packages)
+	case modeRemove:
+		if len(packages) == 0 {
+			fmt.Fprintln(os.Stderr, "-R requires at least one package name")
+			os.Exit(2)
+		}
 	}
 
 	for _, pkg := range packages {
@@ -132,6 +172,11 @@ func main() {
 		case modeRemove:
 			ui.PackageProgress("Removing cache", idx+1, len(packages), pkg)
 			err = removePackage(ui, *rootDir, pkg)
+			if err == nil {
+				if rmErr := removeInstalledPackage(pkg); rmErr != nil {
+					ui.Warn("failed to update installed list for %s: %v", pkg, rmErr)
+				}
+			}
 		}
 
 		if err != nil {
@@ -301,6 +346,7 @@ func (in *installer) Install(pkg string) error {
 		return err
 	}
 
+	in.recordInstall(pkg)
 	in.completed[pkg] = true
 	return nil
 }
@@ -309,6 +355,7 @@ func (in *installer) promptCleanBuild(pkg string) (bool, error) {
 	if !in.interactive {
 		return false, nil
 	}
+	fmt.Println()
 	in.printPackageLine(pkg)
 	fmt.Println("==> Packages to cleanBuild?")
 	fmt.Println("==> [N]one [A]ll [Ab]ort [I]nstalled [No]tInstalled or (1 2 3, 1-3, ^4)")
@@ -333,6 +380,7 @@ func (in *installer) promptDiff(pkg, dest string) error {
 	if !in.interactive {
 		return nil
 	}
+	fmt.Println()
 	in.printPackageLine(pkg)
 	fmt.Println("==> Diffs to show?")
 	fmt.Println("==> [N]one [A]ll [Ab]ort [I]nstalled [No]tInstalled or (1 2 3, 1-3, ^4)")
@@ -375,6 +423,12 @@ func (in *installer) readInput() (string, error) {
 
 func (in *installer) printPackageLine(pkg string) {
 	fmt.Fprintf(os.Stdout, "  1 %-32s (Build Files Exist)\n", pkg)
+}
+
+func (in *installer) recordInstall(pkg string) {
+	if err := addInstalledPackage(pkg); err != nil {
+		in.ui.Warn("failed to record installation for %s: %v", pkg, err)
+	}
 }
 
 func removePackage(ui *printer, root, pkg string) error {
@@ -482,12 +536,10 @@ func updatePackage(dest, pkg string) error {
 		exec.Command("git", "reset", "--hard", fmt.Sprintf("origin/%s", pkg)),
 	}
 
-	for _, cmd := range cmds {
+	for i, cmd := range cmds {
 		cmd.Dir = dest
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
-		cmd.Stdin = os.Stdin
-		if err := cmd.Run(); err != nil {
+		quiet := i > 0
+		if err := runCommand(cmd, quiet); err != nil {
 			return fmt.Errorf("git update failed in %s: %w", dest, err)
 		}
 	}
@@ -620,22 +672,36 @@ func newPrinter(out io.Writer, colorEnabled bool) *printer {
 }
 
 func (p *printer) Pacman(format string, args ...any) {
-	fmt.Fprintf(p.out, "%s %s\n", p.style("::"), fmt.Sprintf(format, args...))
+	msg := fmt.Sprintf(format, args...)
+	fmt.Fprintf(p.out, "%s %s\n", p.style("::"), p.colorize(msg, colorCyan))
 }
 
 func (p *printer) PackageProgress(action string, idx, total int, pkg string) {
-	fmt.Fprintf(p.out, "%s (%d/%d) %s %s...\n", p.style("::"), idx, total, action, pkg)
+	act := p.colorize(action, colorYellow)
+	target := p.colorize(pkg, colorGreen)
+	fmt.Fprintf(p.out, "%s (%d/%d) %s %s...\n", p.style("::"), idx, total, act, target)
 }
 
 func (p *printer) Makepkg(format string, args ...any) {
-	fmt.Fprintf(p.out, "%s %s\n", p.style("==>"), fmt.Sprintf(format, args...))
+	msg := fmt.Sprintf(format, args...)
+	fmt.Fprintf(p.out, "%s %s\n", p.style("==>"), p.colorize(msg, colorGreen))
+}
+
+func (p *printer) Warn(format string, args ...any) {
+	msg := fmt.Sprintf(format, args...)
+	fmt.Fprintf(p.out, "%s %s\n", p.style("::"), p.colorize(msg, colorYellow))
 }
 
 func (p *printer) AurSummary(pkgs []string) {
 	if len(pkgs) == 0 {
 		return
 	}
-	fmt.Fprintf(p.out, "AUR Explicit (%d): %s\n", len(pkgs), strings.Join(pkgs, " "))
+	colored := make([]string, len(pkgs))
+	for i, pkg := range pkgs {
+		colored[i] = p.colorize(pkg, colorMagenta)
+	}
+	header := p.colorize(fmt.Sprintf("AUR Explicit (%d):", len(pkgs)), colorWhite)
+	fmt.Fprintf(p.out, "%s %s\n", header, strings.Join(colored, " "))
 }
 
 func searchPackages(root, repo string, terms []string, ui *printer) error {
@@ -663,10 +729,12 @@ func searchPackages(root, repo string, terms []string, ui *printer) error {
 			continue
 		}
 		found = true
-		fmt.Printf("aur/%s %s\n", ref.name, ref.hash[:8])
+		fmt.Fprintf(ui.out, "%s %s\n",
+			ui.colorize("aur/"+ref.name, colorMagenta),
+			ui.colorize(ref.hash[:8], colorYellow))
 	}
 	if !found {
-		fmt.Println(":: No packages matched the search criteria.")
+		ui.Pacman("No packages matched the search criteria.")
 	}
 	return nil
 }
@@ -857,16 +925,163 @@ func emptyIfNil(values []string) []string {
 	return values
 }
 
-func queryInstalledPackages(pkgs []string) error {
-	args := append([]string{"-Qi"}, pkgs...)
-	cmd := exec.Command("pacman", args...)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
+func runCommand(cmd *exec.Cmd, quiet bool) error {
+	if quiet {
+		cmd.Stdout = io.Discard
+		cmd.Stderr = io.Discard
+	} else {
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+	}
 	cmd.Stdin = os.Stdin
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("pacman -Qi failed: %w", err)
+	return cmd.Run()
+}
+
+func (p *printer) colorize(text, color string) string {
+	if !p.enableANSI || text == "" {
+		return text
+	}
+	return color + text + colorReset
+}
+
+func clearCacheDir(root string, ui *printer) error {
+	root = filepath.Clean(root)
+	if root == "." || root == "/" {
+		return fmt.Errorf("refusing to clear cache root %s", root)
+	}
+	ui.Makepkg("Clearing cache in %s", root)
+	if _, err := os.Stat(root); os.IsNotExist(err) {
+		ui.Makepkg("Cache directory %s does not exist, nothing to clean", root)
+		return nil
+	}
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return fmt.Errorf("failed to read %s: %w", root, err)
+	}
+	for _, entry := range entries {
+		path := filepath.Join(root, entry.Name())
+		if err := os.RemoveAll(path); err != nil {
+			return fmt.Errorf("failed to remove %s: %w", path, err)
+		}
 	}
 	return nil
+}
+
+func listInstalledPackages(filters []string, ui *printer) error {
+	pkgs, err := loadInstalledPackages()
+	if err != nil {
+		return fmt.Errorf("failed to read installed package list: %w", err)
+	}
+	if len(pkgs) == 0 {
+		ui.Pacman("No packages have been recorded yet.")
+		return nil
+	}
+
+	filterSet := make(map[string]struct{})
+	if len(filters) > 0 {
+		for _, pkg := range filters {
+			if err := validatePackageName(pkg); err != nil {
+				return err
+			}
+			filterSet[pkg] = struct{}{}
+		}
+	}
+
+	count := 0
+	for _, pkg := range pkgs {
+		if len(filterSet) > 0 {
+			if _, ok := filterSet[pkg]; !ok {
+				continue
+			}
+		}
+		fmt.Fprintln(ui.out, ui.colorize(pkg, colorMagenta))
+		count++
+	}
+	if count == 0 {
+		ui.Pacman("No packages matched the query.")
+	}
+	return nil
+}
+
+func addInstalledPackage(pkg string) error {
+	pkgs, err := loadInstalledPackages()
+	if err != nil {
+		return err
+	}
+	for _, existing := range pkgs {
+		if existing == pkg {
+			return nil
+		}
+	}
+	pkgs = append(pkgs, pkg)
+	return saveInstalledPackages(pkgs)
+}
+
+func removeInstalledPackage(pkg string) error {
+	pkgs, err := loadInstalledPackages()
+	if err != nil {
+		return err
+	}
+	if len(pkgs) == 0 {
+		return nil
+	}
+	filtered := pkgs[:0]
+	for _, existing := range pkgs {
+		if existing == pkg {
+			continue
+		}
+		filtered = append(filtered, existing)
+	}
+	if len(filtered) == len(pkgs) {
+		return nil
+	}
+	return saveInstalledPackages(filtered)
+}
+
+func loadInstalledPackages() ([]string, error) {
+	path := installedListPath()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	scanner := bufio.NewScanner(bytes.NewReader(data))
+	pkgs := []string{}
+	seen := make(map[string]struct{})
+	for scanner.Scan() {
+		name := strings.TrimSpace(scanner.Text())
+		if name == "" {
+			continue
+		}
+		if _, ok := seen[name]; ok {
+			continue
+		}
+		seen[name] = struct{}{}
+		pkgs = append(pkgs, name)
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+	sort.Strings(pkgs)
+	return pkgs, nil
+}
+
+func saveInstalledPackages(pkgs []string) error {
+	path := installedListPath()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	if len(pkgs) == 0 {
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		return nil
+	}
+	sort.Strings(pkgs)
+	content := strings.Join(pkgs, "\n") + "\n"
+	return os.WriteFile(path, []byte(content), 0o644)
 }
 
 func (p *printer) style(prefix string) string {
@@ -876,9 +1091,9 @@ func (p *printer) style(prefix string) string {
 
 	switch prefix {
 	case "::":
-		return "\033[1;34m::\033[0m"
+		return colorBlue + "::" + colorReset
 	case "==>":
-		return "\033[1;32m==>\033[0m"
+		return colorGreen + "==>" + colorReset
 	default:
 		return prefix
 	}
@@ -951,4 +1166,38 @@ func normalizeShortFlags(argv []string) []string {
 		}
 	}
 	return out
+}
+
+func stateDir() string {
+	if override := os.Getenv("PPLHATEARCH_STATE"); override != "" {
+		return filepath.Clean(override)
+	}
+	if stateHome := os.Getenv("XDG_STATE_HOME"); stateHome != "" {
+		return filepath.Join(stateHome, "pplhatearch")
+	}
+	if home := preferredHome(); home != "" {
+		return filepath.Join(home, ".local", "state", "pplhatearch")
+	}
+	return "./.pplhatearch-state"
+}
+
+func installedListPath() string {
+	return filepath.Join(stateDir(), installedListFile)
+}
+
+func preferredHome() string {
+	if os.Geteuid() == 0 {
+		if sudoUser := os.Getenv("SUDO_USER"); sudoUser != "" {
+			if u, err := user.Lookup(sudoUser); err == nil && u.HomeDir != "" {
+				return u.HomeDir
+			}
+		}
+	}
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		return home
+	}
+	if home := os.Getenv("HOME"); home != "" {
+		return home
+	}
+	return ""
 }
