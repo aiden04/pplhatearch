@@ -1,3 +1,3 @@
-module github.com/aiden/pplhatearch
+module github.com/aiden04/pplhatearch
 
 go 1.25.4
